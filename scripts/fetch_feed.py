@@ -185,32 +185,36 @@ def finbert_scores(titles):
 
 def llm_brief(items):
     """One short call through the fallback chain. Returns (text, provider).
-    Chain: Cohere (org key) -> none (extractive fallback by caller)."""
+    Chain: Cohere (org key, one retry on timeout) -> none (extractive
+    fallback by caller). Every attempt is time-boxed so a slow provider
+    can never stall the run."""
     key = os.environ.get("COHERE_API_KEY")
     if not key:
         return None, "none"
-    lines = [f"- [{i['date']}] ({i['source']}) {i['title']}" for i in items[:12]]
+    lines = [f"- [{i['date']}] ({i['source']}) {i['title']}" for i in items[:10]]
     prompt = (
         "You are a market-news briefer. From these headlines and disclosure "
         "titles (Arabic and English), write a brief of at most 8 short "
         "bullets: what happened, any hard numbers mentioned, and why it "
         "matters for the stock. Use only what the headlines say; do not "
         "invent figures. Reply in English.\n\n" + "\n".join(lines))
-    try:
-        r = requests.post(
-            "https://api.cohere.ai/compatibility/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}",
-                     "Content-Type": "application/json"},
-            json={"model": "command-r-08-2024",
-                  "messages": [{"role": "user", "content": prompt}],
-                  "max_tokens": 400, "temperature": 0.2},
-            timeout=90)
-        r.raise_for_status()
-        text = r.json()["choices"][0]["message"]["content"].strip()
-        return text, "cohere"
-    except Exception as e:
-        print(f"WARN cohere brief failed: {e}", file=sys.stderr)
-        return None, "none"
+    for attempt in (1, 2):
+        try:
+            r = requests.post(
+                "https://api.cohere.ai/compatibility/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}",
+                         "Content-Type": "application/json"},
+                json={"model": "command-r-08-2024",
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 350, "temperature": 0.2},
+                timeout=60)
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"].strip()
+            return text, "cohere"
+        except Exception as e:
+            print(f"WARN cohere brief attempt {attempt} failed: {e}",
+                  file=sys.stderr)
+    return None, "none"
 
 
 def extractive_brief(news, disc):
