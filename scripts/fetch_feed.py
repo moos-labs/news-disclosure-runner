@@ -183,6 +183,19 @@ def finbert_scores(titles):
         return None
 
 
+def _pdate(s):
+    for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s or "", fmt)
+        except Exception:
+            continue
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def by_recency(items):
+    return sorted(items, key=lambda i: _pdate(i["date"]), reverse=True)
+
+
 def llm_brief(items):
     """One short call through the fallback chain. Returns (text, provider).
     Chain: Cohere (org key, one retry on timeout) -> none (extractive
@@ -191,6 +204,7 @@ def llm_brief(items):
     key = os.environ.get("COHERE_API_KEY")
     if not key:
         return None, "none"
+    items = by_recency(items)
     lines = [f"- [{i['date']}] ({i['source']}) {i['title']}" for i in items[:10]]
     prompt = (
         "You are a market-news briefer. From these headlines and disclosure "
@@ -219,7 +233,7 @@ def llm_brief(items):
 
 def extractive_brief(news, disc):
     lines = ["Extractive brief (no LLM used — top items by recency):"]
-    for i in (disc + news)[:8]:
+    for i in by_recency(disc + news)[:8]:
         lines.append(f"- [{i['date']}] ({i['source']}) {i['title']}")
     return "\n".join(lines)
 
