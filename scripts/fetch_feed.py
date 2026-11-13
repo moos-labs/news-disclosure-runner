@@ -283,38 +283,98 @@ def resolve_gnews_url(url):
         return None
 
 
-def fetch_bodies(items, limit=10):
+def _extract_body(html):
+    """Extractor chain for an article page: trafilatura first, then
+    readability, then the largest text block on the page. Returns the
+    longest result any of them produced ('' if all failed)."""
+    best = ""
+    try:
+        import trafilatura
+        t = trafilatura.extract(html, favor_recall=True) or ""
+        best = re.sub(r"\s+", " ", t).strip()
+    except Exception:
+        pass
+    if len(best) < 200:
+        try:
+            from readability import Document
+            from lxml import html as lxml_html
+            frag = Document(html).summary()
+            tree = lxml_html.fromstring(frag)
+            t = re.sub(r"\s+", " ", tree.text_content()).strip()
+            if len(t) > len(best):
+                best = t
+        except Exception:
+            pass
+    if len(best) < 200:
+        try:
+            from lxml import html as lxml_html
+            tree = lxml_html.fromstring(html)
+            for bad in tree.iter("script", "style", "nav", "header",
+                                 "footer", "aside", "form"):
+                bad.getparent().remove(bad)
+            blocks = []
+            for el in tree.iter("article", "main", "div", "section"):
+                t = re.sub(r"\s+", " ", el.text_content()).strip()
+                if len(t) >= 200:
+                    blocks.append(t)
+            if blocks:
+                t = max(blocks, key=len)
+                if len(t) > len(best):
+                    best = t
+        except Exception:
+            pass
+    return best
+
+
+def fetch_bodies(items, limit=12):
     """Fetch and extract the article BODY for the most important items
     (disclosures first, then most recent). Headlines are written to
     attract clicks — sentiment and event classification deserve the
     actual text when it is reachable. Every failure (paywall, block,
     extraction miss) leaves the item title-only; the run never depends
-    on any single page. Bodies are capped for the sweep archive."""
-    try:
-        import trafilatura
-    except Exception as e:
-        print(f"WARN trafilatura unavailable: {e}", file=sys.stderr)
-        return 0
+    on any single page. Bodies are capped for the sweep archive.
+    Every failure is logged with its stage (decode / http / extract)
+    so the yield can be diagnosed instead of guessed at."""
     ordered = sorted(items,
                      key=lambda i: (i.get("kind") == "disclosure",
                                     _pdate(i["date"])),
                      reverse=True)
     got = 0
+    fails = {"decode": 0, "http": 0, "extract": 0}
     for it in ordered[:limit]:
+        stage = "decode"
         try:
-            real = resolve_gnews_url(it["url"])
+            real = None
+            for _attempt in (1, 2):  # one decode retry (fresh signature)
+                real = resolve_gnews_url(it["url"])
+                if real:
+                    break
             if not real:
+                fails["decode"] += 1
                 continue
-            html = requests.get(real, headers=BROWSER_UA,
-                                timeout=30).text
-            text = trafilatura.extract(html, favor_recall=True) or ""
-            text = re.sub(r"\s+", " ", text).strip()
+            stage = "http"
+            resp = requests.get(real, headers=BROWSER_UA, timeout=30)
+            if resp.status_code != 200:
+                fails["http"] += 1
+                print(f"WARN body http {resp.status_code}: {real[:90]}",
+                      file=sys.stderr)
+                continue
+            stage = "extract"
+            text = _extract_body(resp.text)
             if len(text) >= 200:
                 it["body"] = text[:6000]
                 it["resolved_url"] = real
                 got += 1
-        except Exception:
+            else:
+                fails["extract"] += 1
+                print(f"WARN body extract short ({len(text)} chars): "
+                      f"{real[:90]}", file=sys.stderr)
+        except Exception as e:
+            fails[stage] += 1
+            print(f"WARN body {stage} failed: {e}", file=sys.stderr)
             continue
+    print(f"bodies: {got}/{min(limit, len(ordered))} fetched; "
+          f"failures by stage: {fails}", file=sys.stderr)
     return got
 
 
