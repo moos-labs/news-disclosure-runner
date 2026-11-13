@@ -109,6 +109,19 @@ def fetch_rss(ticker, days):
             it["kind"] = (classify_egx(it, code) if market_egx else "news")
             items.append(it)
 
+    if market_egx:
+        # Arabic relevance guard: bare-code queries transliterate in
+        # Arabic Google News (POUL -> بول "Paul"), flooding the feed
+        # with unrelated people news. Arabic items must mention the
+        # company's distinctive Arabic name token or the Latin code.
+        alias_ar = (ALIASES.get(code) or {}).get("ar") or ""
+        tokens = [w for w in re.split(r"\s+", alias_ar) if len(w) >= 5]
+        if tokens:
+            items = [i for i in items
+                     if not is_arabic(i["title"])
+                     or any(t in i["title"] for t in tokens)
+                     or code in i["title"]]
+
     def sortkey(it):
         try:
             return datetime.strptime(it["date"], "%a, %d %b %Y %H:%M:%S %Z")
