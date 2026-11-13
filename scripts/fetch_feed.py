@@ -239,6 +239,188 @@ def multilingual_scores(titles):
         return None
 
 
+BROWSER_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 "
+              "Safari/537.36"}
+
+
+def resolve_gnews_url(url):
+    """Google News RSS article links are opaque tokens behind a JS
+    interstitial — there is no plain redirect to follow. Decode the
+    token to the publisher URL through the page's own batchexecute
+    endpoint (the technique RSS readers use). Returns None on any
+    failure; non-Google links pass through unchanged."""
+    if "news.google.com" not in url:
+        return url
+    try:
+        page = requests.get(url, headers=BROWSER_UA, timeout=30).text
+        sg = re.search(r'data-n-a-sg="([^"]+)"', page)
+        ts = re.search(r'data-n-a-ts="([^"]+)"', page)
+        art = url.split("/articles/")[1].split("?")[0]
+        if not (sg and ts):
+            return None
+        inner = ["Fbv4je",
+                 '["garturlreq",[["X","X",["X","X"],null,null,1,1,'
+                 '"US:en",null,1,null,null,null,null,null,0,1],"X","X",1,'
+                 '[1,1,1],1,1,null,0,0,null,0],"%s",%s,"%s"]'
+                 % (art, ts.group(1), sg.group(1)),
+                 None, "generic"]
+        payload = "f.req=" + urllib.parse.quote(json.dumps([[inner]]))
+        r = requests.post(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute"
+            "?rpcids=Fbv4je",
+            headers={**BROWSER_UA,
+                     "Content-Type":
+                         "application/x-www-form-urlencoded;charset=UTF-8"},
+            data=payload, timeout=30)
+        txt = r.text.replace('\\"', '"')
+        m = re.search(r'garturlres","(https?://[^"]+)"', txt)
+        if not m:
+            return None
+        return (m.group(1).replace("\\u003d", "=")
+                .replace("\\u0026", "&").replace("\\/", "/"))
+    except Exception:
+        return None
+
+
+def fetch_bodies(items, limit=10):
+    """Fetch and extract the article BODY for the most important items
+    (disclosures first, then most recent). Headlines are written to
+    attract clicks — sentiment and event classification deserve the
+    actual text when it is reachable. Every failure (paywall, block,
+    extraction miss) leaves the item title-only; the run never depends
+    on any single page. Bodies are capped for the sweep archive."""
+    try:
+        import trafilatura
+    except Exception as e:
+        print(f"WARN trafilatura unavailable: {e}", file=sys.stderr)
+        return 0
+    ordered = sorted(items,
+                     key=lambda i: (i.get("kind") == "disclosure",
+                                    _pdate(i["date"])),
+                     reverse=True)
+    got = 0
+    for it in ordered[:limit]:
+        try:
+            real = resolve_gnews_url(it["url"])
+            if not real:
+                continue
+            html = requests.get(real, headers=BROWSER_UA,
+                                timeout=30).text
+            text = trafilatura.extract(html, favor_recall=True) or ""
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text) >= 200:
+                it["body"] = text[:6000]
+                it["resolved_url"] = real
+                got += 1
+        except Exception:
+            continue
+    return got
+
+
+# --- Translation chain: Arabic -> English --------------------------------
+# THREE paths, tried in order (the same fallback discipline as the
+# brief chain): 1) Cohere LLM — best quality, the key is already in
+# this runner; 2) NLLB-200 distilled 600M — strongest local model;
+# 3) Helsinki Opus-MT ar-en — lightest local model, most likely to
+# load. Whatever serves is recorded in the summary; if all three fail,
+# items stay Arabic and the multilingual leg still scores them.
+
+def _translate_cohere(texts):
+    key = os.environ.get("COHERE_API_KEY")
+    if not key or not texts:
+        return None
+    joined = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+    prompt = ("Translate each numbered Arabic news text into English. "
+              "Keep every number, percentage and name exact. Reply with "
+              "the same numbers, one translation per line, nothing "
+              f"else.\n\n{joined}")
+    for attempt in (1, 2):
+        try:
+            r = requests.post(
+                "https://api.cohere.ai/compatibility/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}",
+                         "Content-Type": "application/json"},
+                json={"model": "command-r-08-2024",
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 1500, "temperature": 0.0},
+                timeout=60)
+            r.raise_for_status()
+            out = r.json()["choices"][0]["message"]["content"].strip()
+            res = {}
+            for line in out.splitlines():
+                m = re.match(r"\s*(\d+)[.)]\s*(.+)", line)
+                if m:
+                    res[int(m.group(1)) - 1] = m.group(2).strip()
+            if len(res) == len(texts):
+                return [res[i] for i in range(len(texts))]
+            print(f"WARN cohere translate: parsed {len(res)}/{len(texts)}",
+                  file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"WARN cohere translate attempt {attempt}: {e}",
+                  file=sys.stderr)
+    return None
+
+
+def _translate_nllb(texts):
+    try:
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+        import torch
+        name = "facebook/nllb-200-distilled-600M"
+        tok = AutoTokenizer.from_pretrained(name, src_lang="ara_Arab")
+        mdl = AutoModelForSeq2SeqLM.from_pretrained(name)
+        mdl.eval()
+        bos = tok.convert_tokens_to_ids("eng_Latn")
+        out = []
+        with torch.no_grad():
+            for t in texts:
+                enc = tok(t, return_tensors="pt", truncation=True,
+                          max_length=256)
+                gen = mdl.generate(**enc, forced_bos_token_id=bos,
+                                   max_length=256)
+                out.append(tok.batch_decode(gen, skip_special_tokens=True)[0])
+        return out
+    except Exception as e:
+        print(f"WARN nllb translate unavailable: {e}", file=sys.stderr)
+        return None
+
+
+def _translate_opus(texts):
+    try:
+        from transformers import MarianMTModel, MarianTokenizer
+        import torch
+        name = "Helsinki-NLP/opus-mt-ar-en"
+        tok = MarianTokenizer.from_pretrained(name)
+        mdl = MarianMTModel.from_pretrained(name)
+        mdl.eval()
+        out = []
+        with torch.no_grad():
+            for t in texts:
+                enc = tok([t], return_tensors="pt", truncation=True,
+                          max_length=256, padding=True)
+                gen = mdl.generate(**enc, max_length=256)
+                out.append(tok.decode(gen[0], skip_special_tokens=True))
+        return out
+    except Exception as e:
+        print(f"WARN opus translate unavailable: {e}", file=sys.stderr)
+        return None
+
+
+TRANSLATION_PATHS = [("cohere", _translate_cohere),
+                     ("nllb", _translate_nllb),
+                     ("opus-mt", _translate_opus)]
+
+
+def translate_texts(texts):
+    """Returns (translations, provider) — provider 'none' if all fail."""
+    for name, fn in TRANSLATION_PATHS:
+        got = fn(texts)
+        if got and len(got) == len(texts):
+            return got, name
+    return None, "none"
+
+
 def _pdate(s):
     for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%Y-%m-%d"):
         try:
@@ -261,7 +443,12 @@ def llm_brief(items):
     if not key:
         return None, "none"
     items = by_recency(items)
-    lines = [f"- [{i['date']}] ({i['source']}) {i['title']}" for i in items[:10]]
+    lines = []
+    for i in items[:10]:
+        line = f"- [{i['date']}] ({i['source']}) {i['title']}"
+        if i.get("body"):
+            line += f"\n  Article text: {i['body'][:400]}"
+        lines.append(line)
     prompt = (
         "You are a market-news briefer. From these headlines and disclosure "
         "titles (Arabic and English), write a brief of at most 8 short "
@@ -318,10 +505,27 @@ def main():
         return 1
 
     en_titles = [i["title"] for i in (disc + news) if not is_arabic(i["title"])]
-    ar_titles = [i["title"] for i in (disc + news) if is_arabic(i["title"])]
+    ar_items = [i for i in (disc + news) if is_arabic(i["title"])]
+    ar_titles = [i["title"] for i in ar_items]
     ar_count = len(ar_titles)
     sent = finbert_scores(en_titles)
     msent = multilingual_scores(ar_titles)
+
+    # Depth over headlines: fetch article bodies for the top items,
+    # translate the Arabic ones (3-path chain), and let the FINANCIAL
+    # model score the translations — a general multilingual model
+    # misreads financial Arabic ("profits fall 39%" came back
+    # positive); FinBERT on a faithful translation does not.
+    bodies_fetched = fetch_bodies(disc + news)
+    tr_texts = [(i["title"] + " — " + i["body"][:500]) if i.get("body")
+                else i["title"] for i in ar_items]
+    translations, tr_provider = (translate_texts(tr_texts)
+                                 if tr_texts else (None, "none"))
+    tr_sent = None
+    if translations:
+        for i, t in zip(ar_items, translations):
+            i["text_en"] = t
+        tr_sent = finbert_scores(translations)
 
     if args.no_llm:
         brief, provider = None, "disabled"
@@ -361,6 +565,13 @@ def main():
         summary["multilingual_negative"] = msent["negative"]
         summary["multilingual_neutral"] = msent["neutral"]
         summary["multilingual_scored"] = msent["count"]
+    summary["bodies_fetched"] = bodies_fetched
+    summary["translation_provider"] = tr_provider
+    if tr_sent:
+        summary["translated_positive"] = tr_sent["positive"]
+        summary["translated_negative"] = tr_sent["negative"]
+        summary["translated_neutral"] = tr_sent["neutral"]
+        summary["translated_scored"] = tr_sent["count"]
     with open("results/feed_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=1)
     with open("results/headlines.txt", "w", encoding="utf-8") as f:
