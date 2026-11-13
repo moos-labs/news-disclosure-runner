@@ -325,8 +325,19 @@ def fetch_bodies(items, limit=10):
 # 3) Helsinki Opus-MT ar-en — lightest local model, most likely to
 # load. Whatever serves is recorded in the summary; if all three fail,
 # items stay Arabic and the multilingual leg still scores them.
+#
+# CHUNKED, per chunk fallback (fix for digest #25): the original
+# design sent all 27 texts in ONE Cohere call and demanded an exact
+# 27/27 numbered parse — Cohere answered, but only 24 lines parsed
+# (run log: "parsed 24/27"), so the whole result was discarded and
+# NLLB retranslated everything. Now texts go in chunks of 6; a chunk
+# that fails a path falls to the next path ON ITS OWN, good chunks are
+# never thrown away, and local models load once per run, not per chunk.
 
-def _translate_cohere(texts):
+_MODEL_CACHE = {}
+
+
+def _translate_cohere_chunk(texts):
     key = os.environ.get("COHERE_API_KEY")
     if not key or not texts:
         return None
@@ -343,7 +354,8 @@ def _translate_cohere(texts):
                          "Content-Type": "application/json"},
                 json={"model": "command-r-08-2024",
                       "messages": [{"role": "user", "content": prompt}],
-                      "max_tokens": 1500, "temperature": 0.0},
+                      "max_tokens": max(600, 240 * len(texts)),
+                      "temperature": 0.0},
                 timeout=60)
             r.raise_for_status()
             out = r.json()["choices"][0]["message"]["content"].strip()
@@ -363,14 +375,21 @@ def _translate_cohere(texts):
     return None
 
 
-def _translate_nllb(texts):
-    try:
+def _get_nllb():
+    if "nllb" not in _MODEL_CACHE:
         from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-        import torch
         name = "facebook/nllb-200-distilled-600M"
         tok = AutoTokenizer.from_pretrained(name, src_lang="ara_Arab")
         mdl = AutoModelForSeq2SeqLM.from_pretrained(name)
         mdl.eval()
+        _MODEL_CACHE["nllb"] = (tok, mdl)
+    return _MODEL_CACHE["nllb"]
+
+
+def _translate_nllb_chunk(texts):
+    try:
+        import torch
+        tok, mdl = _get_nllb()
         bos = tok.convert_tokens_to_ids("eng_Latn")
         out = []
         with torch.no_grad():
@@ -386,14 +405,21 @@ def _translate_nllb(texts):
         return None
 
 
-def _translate_opus(texts):
-    try:
+def _get_opus():
+    if "opus" not in _MODEL_CACHE:
         from transformers import MarianMTModel, MarianTokenizer
-        import torch
         name = "Helsinki-NLP/opus-mt-ar-en"
         tok = MarianTokenizer.from_pretrained(name)
         mdl = MarianMTModel.from_pretrained(name)
         mdl.eval()
+        _MODEL_CACHE["opus"] = (tok, mdl)
+    return _MODEL_CACHE["opus"]
+
+
+def _translate_opus_chunk(texts):
+    try:
+        import torch
+        tok, mdl = _get_opus()
         out = []
         with torch.no_grad():
             for t in texts:
@@ -407,18 +433,33 @@ def _translate_opus(texts):
         return None
 
 
-TRANSLATION_PATHS = [("cohere", _translate_cohere),
-                     ("nllb", _translate_nllb),
-                     ("opus-mt", _translate_opus)]
+TRANSLATION_PATHS = [("cohere", _translate_cohere_chunk),
+                     ("nllb", _translate_nllb_chunk),
+                     ("opus-mt", _translate_opus_chunk)]
 
 
-def translate_texts(texts):
-    """Returns (translations, provider) — provider 'none' if all fail."""
-    for name, fn in TRANSLATION_PATHS:
-        got = fn(texts)
-        if got and len(got) == len(texts):
-            return got, name
-    return None, "none"
+def translate_texts(texts, chunk_size=6):
+    """Returns (translations, provider) — provider is the '+'-joined
+    set of paths that actually served, in first-use order ('cohere'
+    when the primary served everything); 'none' if any chunk failed
+    on all three paths, in which case the caller keeps the items
+    untranslated rather than misaligned."""
+    out, used = [], []
+    for i in range(0, len(texts), chunk_size):
+        chunk = texts[i:i + chunk_size]
+        got, served = None, None
+        for name, fn in TRANSLATION_PATHS:
+            got = fn(chunk)
+            if got and len(got) == len(chunk):
+                served = name
+                break
+            got = None
+        if got is None:
+            return None, "none"
+        out.extend(got)
+        if served not in used:
+            used.append(served)
+    return out, "+".join(used)
 
 
 def _pdate(s):
