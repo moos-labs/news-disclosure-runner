@@ -142,7 +142,7 @@ def fetch_edgar(ticker):
             if row["ticker"] == bare:
                 cik = str(row["cik_str"]).zfill(10)
                 break
-        if not cik:
+        if not cik or not cik.isdigit():
             return []
         d = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json",
                          headers=UA, timeout=30).json()
@@ -298,8 +298,11 @@ def _extract_body(html):
         try:
             from readability import Document
             from lxml import html as lxml_html
+            # Untrusted markup: never resolve entities or touch the net.
+            parser = lxml_html.HTMLParser(resolve_entities=False,
+                                          no_network=True)
             frag = Document(html).summary()
-            tree = lxml_html.fromstring(frag)
+            tree = lxml_html.fromstring(frag, parser=parser)
             t = re.sub(r"\s+", " ", tree.text_content()).strip()
             if len(t) > len(best):
                 best = t
@@ -308,7 +311,9 @@ def _extract_body(html):
     if len(best) < 200:
         try:
             from lxml import html as lxml_html
-            tree = lxml_html.fromstring(html)
+            parser = lxml_html.HTMLParser(resolve_entities=False,
+                                          no_network=True)
+            tree = lxml_html.fromstring(html, parser=parser)
             for bad in tree.iter("script", "style", "nav", "header",
                                  "footer", "aside", "form"):
                 bad.getparent().remove(bad)
