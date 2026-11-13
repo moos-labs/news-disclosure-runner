@@ -2,3 +2,4 @@ requests
 transformers
 torch
 trafilatura
+readability-lxml
