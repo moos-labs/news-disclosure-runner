@@ -358,14 +358,21 @@ def fetch_bodies(items, limit=12):
                 fails["decode"] += 1
                 continue
             stage = "http"
-            resp = requests.get(real, headers=BROWSER_UA, timeout=30)
+            resp = requests.get(real, headers=BROWSER_UA, timeout=30,
+                                stream=True)
             if resp.status_code != 200:
                 fails["http"] += 1
                 print(f"WARN body http {resp.status_code}: {real[:90]}",
                       file=sys.stderr)
                 continue
+            raw = b""
+            for part in resp.iter_content(65536):  # streamed, capped
+                raw += part
+                if len(raw) > 3_000_000:
+                    break
+            html = raw.decode(resp.encoding or "utf-8", errors="replace")
             stage = "extract"
-            text = _extract_body(resp.text)
+            text = _extract_body(html)
             if len(text) >= 200:
                 it["body"] = text[:6000]
                 it["resolved_url"] = real
@@ -507,17 +514,21 @@ TRANSLATION_PATHS = [("cohere", _translate_cohere_chunk),
                      ("opus-mt", _translate_opus_chunk)]
 
 
-def translate_texts(texts, chunk_size=6):
+def translate_texts(texts, chunk_size=6, allow_llm=True):
     """Returns (translations, provider) — provider is the '+'-joined
     set of paths that actually served, in first-use order ('cohere'
     when the primary served everything); 'none' if any chunk failed
     on all three paths, in which case the caller keeps the items
-    untranslated rather than misaligned."""
+    untranslated rather than misaligned. allow_llm=False (the
+    --no-llm flag) removes the Cohere path entirely — the flag gates
+    EVERY external LLM call, not just the brief."""
+    paths = [(n, f) for n, f in TRANSLATION_PATHS
+             if allow_llm or n != "cohere"]
     out, used = [], []
     for i in range(0, len(texts), chunk_size):
         chunk = texts[i:i + chunk_size]
         got, served = None, None
-        for name, fn in TRANSLATION_PATHS:
+        for name, fn in paths:
             got = fn(chunk)
             if got and len(got) == len(chunk):
                 served = name
@@ -534,7 +545,10 @@ def translate_texts(texts, chunk_size=6):
 def _pdate(s):
     for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%Y-%m-%d"):
         try:
-            return datetime.strptime(s or "", fmt)
+            d = datetime.strptime(s or "", fmt)
+            # strptime yields naive datetimes; the fallback below is
+            # aware — never let the two mix in a sort (TypeError).
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
         except Exception:
             continue
     return datetime.min.replace(tzinfo=timezone.utc)
@@ -629,8 +643,9 @@ def main():
     bodies_fetched = fetch_bodies(disc + news)
     tr_texts = [(i["title"] + " — " + i["body"][:500]) if i.get("body")
                 else i["title"] for i in ar_items]
-    translations, tr_provider = (translate_texts(tr_texts)
-                                 if tr_texts else (None, "none"))
+    translations, tr_provider = (
+        translate_texts(tr_texts, allow_llm=not args.no_llm)
+        if tr_texts else (None, "none"))
     tr_sent = None
     if translations:
         for i, t in zip(ar_items, translations):
