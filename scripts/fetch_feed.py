@@ -406,7 +406,11 @@ def _translate_cohere_chunk(texts):
               "Keep every number, percentage and name exact. Reply with "
               "the same numbers, one translation per line, nothing "
               f"else.\n\n{joined}")
-    for attempt in (1, 2):
+    # Translation chunks are latency-bounded (issue #48): ONE attempt at
+    # 30 s. In proof #45, three chunks burned ~5 minutes in repeated
+    # 60 s timeouts before the local path — which serves a warm chunk in
+    # ~15 s — was even tried. A fast failure beats a slow success here.
+    for attempt in (1,):
         try:
             r = requests.post(
                 "https://api.cohere.ai/compatibility/v1/chat/completions",
@@ -416,7 +420,7 @@ def _translate_cohere_chunk(texts):
                       "messages": [{"role": "user", "content": prompt}],
                       "max_tokens": max(600, 240 * len(texts)),
                       "temperature": 0.0},
-                timeout=60)
+                timeout=30)
             r.raise_for_status()
             out = r.json()["choices"][0]["message"]["content"].strip()
             res = {}
