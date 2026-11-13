@@ -196,6 +196,49 @@ def finbert_scores(titles):
         return None
 
 
+def multilingual_scores(titles):
+    """Average sentiment probabilities over ARABIC headlines with an
+    XLM-RoBERTa multilingual model — FinBERT is English-only, and for
+    EGX tickers most of the coverage is Arabic (in the first POUL pilot
+    43 of 45 headlines were Arabic and went unscored). Labels are read
+    from the model's own config, never assumed by index. Returns None
+    if the model cannot load."""
+    if not titles:
+        return None
+    try:
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        import torch
+        name = "cardiffnlp/twitter-xlm-roberta-base-sentiment-multilingual"
+        tok = AutoTokenizer.from_pretrained(name)
+        mdl = AutoModelForSequenceClassification.from_pretrained(name)
+        mdl.eval()
+        id2label = {int(k): str(v).lower()
+                    for k, v in (mdl.config.id2label or {}).items()}
+        agg = {"positive": 0.0, "negative": 0.0, "neutral": 0.0}
+        n = 0
+        with torch.no_grad():
+            for t in titles:
+                enc = tok(t, return_tensors="pt", truncation=True,
+                          max_length=128)
+                probs = torch.softmax(mdl(**enc).logits, dim=1)[0].tolist()
+                for i, p in enumerate(probs):
+                    lab = id2label.get(i, "")
+                    if "pos" in lab:
+                        agg["positive"] += p
+                    elif "neg" in lab:
+                        agg["negative"] += p
+                    else:
+                        agg["neutral"] += p
+                n += 1
+        if n == 0:
+            return None
+        return {k: round(v / n, 3) for k, v in agg.items()} | {"count": n}
+    except Exception as e:
+        print(f"WARN multilingual sentiment unavailable: {e}",
+              file=sys.stderr)
+        return None
+
+
 def _pdate(s):
     for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%Y-%m-%d"):
         try:
@@ -275,8 +318,10 @@ def main():
         return 1
 
     en_titles = [i["title"] for i in (disc + news) if not is_arabic(i["title"])]
-    ar_count = sum(1 for i in (disc + news) if is_arabic(i["title"]))
+    ar_titles = [i["title"] for i in (disc + news) if is_arabic(i["title"])]
+    ar_count = len(ar_titles)
     sent = finbert_scores(en_titles)
+    msent = multilingual_scores(ar_titles)
 
     if args.no_llm:
         brief, provider = None, "disabled"
@@ -311,6 +356,11 @@ def main():
         summary["finbert_negative"] = sent["negative"]
         summary["finbert_neutral"] = sent["neutral"]
         summary["finbert_scored"] = sent["count"]
+    if msent:
+        summary["multilingual_positive"] = msent["positive"]
+        summary["multilingual_negative"] = msent["negative"]
+        summary["multilingual_neutral"] = msent["neutral"]
+        summary["multilingual_scored"] = msent["count"]
     with open("results/feed_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=1)
     with open("results/headlines.txt", "w", encoding="utf-8") as f:
