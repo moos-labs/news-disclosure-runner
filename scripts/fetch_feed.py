@@ -170,8 +170,14 @@ def fetch_edgar(ticker):
 
 
 def _title_tokens(t):
-    return {w for w in re.split(r"[^\w]+", (t or "").lower())
-            if len(w) >= 3}
+    # Arabic orthography normalization (issue #55 follow-up): the
+    # same word appears as ادارة in Mubasher titles and إدارة in
+    # EGX titles — without folding hamza/ة/ى variants the token
+    # sets of two titles for the SAME disclosure barely intersect.
+    t = (t or "").lower()
+    t = (t.replace("إ", "ا").replace("أ", "ا").replace("آ", "ا")
+          .replace("ة", "ه").replace("ى", "ي"))
+    return {w for w in re.split(r"[^\w]+", t) if len(w) >= 3}
 
 
 def _item_day(it):
@@ -210,13 +216,25 @@ def attach_egx_harvest(disc, ticker):
     h_items = [h for h in harvest.get("items", [])
                if h.get("body") and len(h["body"]) >= 200]
     alias = ALIASES.get(ticker) or {}
-    stop = {w.lower() for v in alias.values()
+
+    def fold(w):
+        return (w.replace("إ", "ا").replace("أ", "ا").replace("آ", "ا")
+                 .replace("ة", "ه").replace("ى", "ي"))
+
+    # Stop words must be folded the same way _title_tokens folds
+    # titles, or the company name leaks back in as «القاهره».
+    stop = {fold(w.lower()) for v in alias.values()
             for w in re.split(r"\s+", v) if len(w) >= 3}
-    stop |= {"العنوان", "egx", "com", "www", "مباشر", "مباشرة"}
+    stop |= {fold(w) for w in
+             ("العنوان", "egx", "com", "www", "مباشر", "مباشرة")}
 
     def toks(title):
-        t = re.sub(r"\s+-\s+[^-]+$", "", title or "")
-        return {w for w in _title_tokens(t) if w not in stop}
+        # No " - <tail>" stripping here (issue #55 follow-up): in
+        # EGX harvest titles the dash separates the company prefix
+        # from the real title — stripping it deleted the entire
+        # discriminating tail and collapsed the token set.
+        return {w for w in _title_tokens(title or "")
+                if w not in stop}
 
     attached = 0
     for it in disc:
@@ -226,23 +244,37 @@ def attach_egx_harvest(disc, ticker):
         if not t_tok:
             continue
         best, best_rank = None, 0.0
+        i_day = _item_day(it)
         for h in h_items:
             h_tok = toks(h.get("title"))
             if not h_tok:
                 continue
-            base = len(t_tok & h_tok) / (len(t_tok | h_tok) or 1)
-            if base < 0.35:
-                continue  # threshold on the base score (INS-R3-05)
-            rank = base
             h_day = None
             try:
                 h_day = datetime.strptime(h.get("date", ""),
                                           "%Y-%m-%d").date()
             except Exception:
                 pass
-            i_day = _item_day(it)
-            if h_day and i_day and h_day == i_day:
-                rank += 0.25
+            # Date gate (issue #55 follow-up): when both dates are
+            # known they must be within 3 days — an October AGM
+            # summary and a November EGM invitation share the whole
+            # meeting vocabulary ({الجمعية, العامة, العادية}) and
+            # pass a pure token threshold while being different
+            # disclosures.
+            if h_day and i_day and abs((h_day - i_day).days) > 3:
+                continue
+            # Containment, not Jaccard (issue #55 follow-up): the
+            # feed title is a verbose republication header while the
+            # harvest title is the exchange's clean one — the same
+            # disclosure scores ~0.2 on Jaccard but ~1.0 on
+            # containment of the smaller set, while a DIFFERENT
+            # same-company disclosure stays low on both.
+            base = (len(t_tok & h_tok)
+                    / (min(len(t_tok), len(h_tok)) or 1))
+            if base < 0.75:
+                continue  # threshold on the base score (INS-R3-05)
+            rank = base + (0.25 if h_day and i_day
+                           and h_day == i_day else 0.0)
             if rank > best_rank:
                 best, best_rank = h, rank
         if best is not None:
