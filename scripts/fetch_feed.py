@@ -169,6 +169,74 @@ def fetch_edgar(ticker):
         return []
 
 
+def _title_tokens(t):
+    return {w for w in re.split(r"[^\w]+", (t or "").lower())
+            if len(w) >= 3}
+
+
+def _item_day(it):
+    for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(it.get("date", ""), fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+def attach_egx_harvest(disc):
+    """Issue #53: attach official EGX disclosure bodies harvested on
+    the worker (issue #47) to disclosure items that came back
+    title-only — Mubasher's pages are JS shells, so fetch_bodies
+    cannot extract them, but the exchange's own text is now
+    available locally via EGX_HARVEST_FILE. Matching: same company
+    (the harvest is per-ticker) by title-token overlap, with a date
+    agreement bonus. Returns how many bodies were attached."""
+    path = os.environ.get("EGX_HARVEST_FILE")
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        harvest = json.load(open(path, encoding="utf-8"))
+        h_items = [h for h in harvest.get("items", [])
+                   if h.get("body") and len(h["body"]) >= 200]
+    except Exception as e:
+        print(f"WARN egx harvest unreadable: {e}", file=sys.stderr)
+        return 0
+    attached = 0
+    for it in disc:
+        if len(it.get("body") or "") >= 200:
+            continue
+        t_tok = _title_tokens(it.get("title"))
+        if not t_tok:
+            continue
+        best, best_score = None, 0.0
+        for h in h_items:
+            h_tok = _title_tokens(h.get("title"))
+            if not h_tok:
+                continue
+            inter = len(t_tok & h_tok)
+            union = len(t_tok | h_tok) or 1
+            score = inter / union
+            h_day = None
+            try:
+                h_day = datetime.strptime(h.get("date", ""),
+                                          "%Y-%m-%d").date()
+            except Exception:
+                pass
+            i_day = _item_day(it)
+            if h_day and i_day and h_day == i_day:
+                score += 0.25
+            if score > best_score:
+                best, best_score = h, score
+        if best is not None and best_score >= 0.35:
+            it["body"] = best["body"][:6000]
+            it["resolved_url"] = best.get("url", "")
+            it["body_source"] = "egx-harvest"
+            attached += 1
+    if attached:
+        print(f"egx-harvest: attached {attached} official bodies")
+    return attached
+
+
 def finbert_scores(titles):
     """Average FinBERT probabilities over English headlines. Returns None
     if the model cannot load — sentiment is an enhancement, not a gate."""
@@ -641,6 +709,7 @@ def main():
     # misreads financial Arabic ("profits fall 39%" came back
     # positive); FinBERT on a faithful translation does not.
     bodies_fetched = fetch_bodies(disc + news)
+    egx_attached = attach_egx_harvest(disc)
     tr_texts = [(i["title"] + " — " + i["body"][:500]) if i.get("body")
                 else i["title"] for i in ar_items]
     translations, tr_provider = (
@@ -691,6 +760,7 @@ def main():
         summary["multilingual_neutral"] = msent["neutral"]
         summary["multilingual_scored"] = msent["count"]
     summary["bodies_fetched"] = bodies_fetched
+    summary["egx_bodies_attached"] = egx_attached
     summary["translation_provider"] = tr_provider
     if tr_sent:
         summary["translated_positive"] = tr_sent["positive"]
