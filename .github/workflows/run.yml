@@ -2,6 +2,11 @@ name: Run analysis
 
 on:
   workflow_dispatch:
+    inputs:
+      commands:
+        description: 'Borsagator composed commands (overrides vars.COMMANDS)'
+        required: false
+        type: string
 
 jobs:
   run:
@@ -28,7 +33,7 @@ jobs:
       - name: Run commands
         env:
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
-        run: ${{ vars.COMMANDS }}
+        run: ${{ inputs.commands || vars.COMMANDS }}
 
       - name: Upload results
         if: always()
