@@ -232,7 +232,7 @@ def _load_egx_harvest(ticker):
     return harvest, "published"
 
 
-def attach_egx_harvest(disc, ticker):
+def attach_egx_harvest(disc, ticker, days=30):
     """Issue #53: attach official EGX disclosure bodies harvested on
     the worker (issue #47) to disclosure items that came back
     title-only — Mubasher's pages are JS shells, so fetch_bodies
@@ -244,15 +244,23 @@ def attach_egx_harvest(disc, ticker):
     the run's, boilerplate tokens (company name, source suffixes)
     are stripped before scoring, the threshold applies to the BASE
     score (the date bonus only ranks candidates), and each harvest
-    item can attach to at most one feed item. Returns
-    (bodies attached, harvest source)."""
+    item can attach to at most one feed item. Harvest items no
+    feed item claims are then ADDED as disclosure items in their
+    own right (issue #91: Google News RSS is a ranked sample, not
+    the disclosure list — the 12 Nov Q3 disclosure was absent from
+    the feed entirely in consecutive runs while older items
+    surfaced, so enrichment alone could never deliver it to the
+    overlay; the harvest is the exchange's own list). Added items
+    are bounded by the run's day window and keep their provenance
+    in body_source. Returns (bodies attached, disclosures added,
+    harvest source)."""
     harvest, source = _load_egx_harvest(ticker)
     if harvest is None:
-        return 0, ""
+        return 0, 0, ""
     if harvest.get("ticker") != ticker:
         print(f"WARN egx harvest ticker mismatch: "
               f"{harvest.get('ticker')} != {ticker}", file=sys.stderr)
-        return 0, ""
+        return 0, 0, ""
     h_items = [h for h in harvest.get("items", [])
                if h.get("body") and len(h["body"]) >= 200]
     alias = ALIASES.get(ticker) or {}
@@ -323,9 +331,36 @@ def attach_egx_harvest(disc, ticker):
             it["body_source"] = "egx-harvest"
             h_items.remove(best)  # one harvest item, one feed item
             attached += 1
-    if attached:
-        print(f"egx-harvest: attached {attached} official bodies")
-    return attached, source
+    # Issue #91: whatever the RSS sample did not carry is added
+    # outright — the overlay must receive the harvested disclosures
+    # themselves, not only bodies for items RSS happened to surface.
+    added = 0
+    today = datetime.now(timezone.utc).date()
+    for h in list(h_items):
+        h_day = None
+        try:
+            h_day = datetime.strptime(h.get("date", ""),
+                                      "%Y-%m-%d").date()
+        except Exception:
+            pass
+        if h_day is not None and not (0 <= (today - h_day).days <= days):
+            continue  # outside the run's window: not this run's news
+        disc.append({
+            "title": h.get("title") or "",
+            "date": h.get("date") or "",
+            "source": "egx.com.eg",
+            "url": h.get("url", ""),
+            "kind": "disclosure",
+            "body": h["body"][:6000],
+            "resolved_url": h.get("url", ""),
+            "body_source": "egx-harvest",
+        })
+        h_items.remove(h)
+        added += 1
+    if attached or added:
+        print(f"egx-harvest: attached {attached} official bodies, "
+              f"added {added} harvested disclosures")
+    return attached, added, source
 
 
 def finbert_scores(titles):
@@ -787,20 +822,25 @@ def main():
         print("ERROR: no items fetched from any source", file=sys.stderr)
         return 1
 
-    en_titles = [i["title"] for i in (disc + news) if not is_arabic(i["title"])]
-    ar_items = [i for i in (disc + news) if is_arabic(i["title"])]
-    ar_titles = [i["title"] for i in ar_items]
-    ar_count = len(ar_titles)
-    sent = finbert_scores(en_titles)
-    msent = multilingual_scores(ar_titles)
-
     # Depth over headlines: fetch article bodies for the top items,
     # translate the Arabic ones (3-path chain), and let the FINANCIAL
     # model score the translations — a general multilingual model
     # misreads financial Arabic ("profits fall 39%" came back
     # positive); FinBERT on a faithful translation does not.
     bodies_fetched = fetch_bodies(disc + news)
-    egx_attached, egx_source = attach_egx_harvest(disc, ticker)
+    egx_attached, egx_added, egx_source = attach_egx_harvest(
+        disc, ticker, days=args.days)
+
+    # Title-sentiment snapshots come AFTER the EGX attach (issue
+    # #91): disclosures the harvest adds join every downstream pass
+    # (multilingual scoring, translation, the brief) instead of
+    # reaching the collected feed unscored.
+    en_titles = [i["title"] for i in (disc + news) if not is_arabic(i["title"])]
+    ar_items = [i for i in (disc + news) if is_arabic(i["title"])]
+    ar_titles = [i["title"] for i in ar_items]
+    ar_count = len(ar_titles)
+    sent = finbert_scores(en_titles)
+    msent = multilingual_scores(ar_titles)
     tr_texts = [(i["title"] + " — " + i["body"][:500]) if i.get("body")
                 else i["title"] for i in ar_items]
     translations, tr_provider = (
@@ -852,6 +892,7 @@ def main():
         summary["multilingual_scored"] = msent["count"]
     summary["bodies_fetched"] = bodies_fetched
     summary["egx_bodies_attached"] = egx_attached
+    summary["egx_disclosures_added"] = egx_added
     if egx_source:
         summary["egx_harvest_source"] = egx_source
     summary["translation_provider"] = tr_provider
