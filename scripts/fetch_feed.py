@@ -189,30 +189,70 @@ def _item_day(it):
     return None
 
 
+HARVEST_POINTER_URL = ("https://raw.githubusercontent.com/moos-labs/"
+                       "borsagator/archive/harvest/{code}.json")
+
+
+def _load_egx_harvest(ticker):
+    """Return (harvest_dict, source) or (None, ""). Sources, in
+    order: (1) EGX_HARVEST_FILE — the worker's local cache, set by
+    worker.py (issue #53); when the variable is set the behaviour
+    is exactly the pre-#91 one. (2) Issue #91: GitHub Actions runs
+    have no worker and no local file, so the attach silently
+    no-oped and the overlay lost the official EGX bodies. Fall
+    back to the newest harvest the worker published on the
+    borsagator archive branch under the stable pointer
+    harvest/<CODE>.json (worker.py refreshes it on every
+    published harvest). The repo is public, so a plain raw fetch
+    needs no credential and no API quota. Any failure returns
+    None — the feed stays title-only, as before."""
+    path = os.environ.get("EGX_HARVEST_FILE")
+    if path:
+        if not os.path.exists(path):
+            return None, ""
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f), "local-file"
+        except Exception as e:
+            print(f"WARN egx harvest unreadable: {e}", file=sys.stderr)
+            return None, ""
+    if not ticker.endswith(".CA"):
+        return None, ""
+    url = HARVEST_POINTER_URL.format(code=ticker.split(".")[0].upper())
+    try:
+        r = requests.get(url, headers=UA, timeout=20)
+        r.raise_for_status()
+        harvest = r.json()
+    except Exception as e:
+        print(f"WARN egx published harvest unavailable: {e}",
+              file=sys.stderr)
+        return None, ""
+    print(f"egx-harvest: using published harvest for {ticker} "
+          f"(harvested_at={harvest.get('harvested_at')})")
+    return harvest, "published"
+
+
 def attach_egx_harvest(disc, ticker):
     """Issue #53: attach official EGX disclosure bodies harvested on
     the worker (issue #47) to disclosure items that came back
     title-only — Mubasher's pages are JS shells, so fetch_bodies
-    cannot extract them, but the exchange's own text is now
-    available locally via EGX_HARVEST_FILE. Matching: title-token
-    overlap with a date-agreement bonus. Panel round 3 hardening
-    (INS-R3-05/R3-08): the harvest's ticker must equal the run's,
-    boilerplate tokens (company name, source suffixes) are stripped
-    before scoring, the threshold applies to the BASE score (the
-    date bonus only ranks candidates), and each harvest item can
-    attach to at most one feed item. Returns bodies attached."""
-    path = os.environ.get("EGX_HARVEST_FILE")
-    if not path or not os.path.exists(path):
-        return 0
-    try:
-        harvest = json.load(open(path, encoding="utf-8"))
-    except Exception as e:
-        print(f"WARN egx harvest unreadable: {e}", file=sys.stderr)
-        return 0
+    cannot extract them, but the exchange's own text is available
+    via EGX_HARVEST_FILE on the worker, or via the published
+    harvest pointer in Actions runs (issue #91). Matching:
+    title-token overlap with a date-agreement bonus. Panel round 3
+    hardening (INS-R3-05/R3-08): the harvest's ticker must equal
+    the run's, boilerplate tokens (company name, source suffixes)
+    are stripped before scoring, the threshold applies to the BASE
+    score (the date bonus only ranks candidates), and each harvest
+    item can attach to at most one feed item. Returns
+    (bodies attached, harvest source)."""
+    harvest, source = _load_egx_harvest(ticker)
+    if harvest is None:
+        return 0, ""
     if harvest.get("ticker") != ticker:
         print(f"WARN egx harvest ticker mismatch: "
               f"{harvest.get('ticker')} != {ticker}", file=sys.stderr)
-        return 0
+        return 0, ""
     h_items = [h for h in harvest.get("items", [])
                if h.get("body") and len(h["body"]) >= 200]
     alias = ALIASES.get(ticker) or {}
@@ -285,7 +325,7 @@ def attach_egx_harvest(disc, ticker):
             attached += 1
     if attached:
         print(f"egx-harvest: attached {attached} official bodies")
-    return attached
+    return attached, source
 
 
 def finbert_scores(titles):
@@ -760,7 +800,7 @@ def main():
     # misreads financial Arabic ("profits fall 39%" came back
     # positive); FinBERT on a faithful translation does not.
     bodies_fetched = fetch_bodies(disc + news)
-    egx_attached = attach_egx_harvest(disc, ticker)
+    egx_attached, egx_source = attach_egx_harvest(disc, ticker)
     tr_texts = [(i["title"] + " — " + i["body"][:500]) if i.get("body")
                 else i["title"] for i in ar_items]
     translations, tr_provider = (
@@ -812,6 +852,8 @@ def main():
         summary["multilingual_scored"] = msent["count"]
     summary["bodies_fetched"] = bodies_fetched
     summary["egx_bodies_attached"] = egx_attached
+    if egx_source:
+        summary["egx_harvest_source"] = egx_source
     summary["translation_provider"] = tr_provider
     if tr_sent:
         summary["translated_positive"] = tr_sent["positive"]
