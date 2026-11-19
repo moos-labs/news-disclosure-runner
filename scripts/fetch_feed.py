@@ -232,6 +232,37 @@ def _load_egx_harvest(ticker):
     return harvest, "published"
 
 
+def _harvest_publish_date(body):
+    """Publish date of one harvested EGX disclosure, read from the
+    standalone dd/mm/yyyy line under the title (borsagator #109
+    follow-up). Returns a date, or None when the body has no such
+    line.
+
+    The harvest's own "date" field must NOT be trusted: the
+    harvester stamps the FIRST date in the head of the body, and
+    for earnings the title line itself carries the reporting
+    period ("... عن الفترة: من 01/01/2026 إلى 30/09/2026"), so the
+    period start wins — COMI 297291/297289 were stamped 2026-01-01
+    while the real publish date sits on its own line just below
+    ("10/11/2026"). Same rule as the #109 pilot extractor's
+    announced date (borsagator scripts/disclosure_events.py
+    _announced, basis "standalone-date-line"): a date only counts
+    when it stands alone on its own line. A date embedded in a
+    sentence (period range, meeting date, ...) is never a publish
+    date, and there is NO fallback to the harvest "date" field — an
+    item with no standalone date line is dateless, never silently
+    stamped with a period start. No network is involved: the line
+    is already in the harvested body."""
+    for m in re.finditer(r"(?m)^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$",
+                         body or ""):
+        try:
+            return datetime(int(m.group(3)), int(m.group(2)),
+                            int(m.group(1))).date()
+        except ValueError:
+            continue  # invalid standalone line: keep looking
+    return None
+
+
 def attach_egx_harvest(disc, ticker, days=30):
     """Issue #53: attach official EGX disclosure bodies harvested on
     the worker (issue #47) to disclosure items that came back
@@ -297,12 +328,10 @@ def attach_egx_harvest(disc, ticker, days=30):
             h_tok = toks(h.get("title"))
             if not h_tok:
                 continue
-            h_day = None
-            try:
-                h_day = datetime.strptime(h.get("date", ""),
-                                          "%Y-%m-%d").date()
-            except Exception:
-                pass
+            # Issue #109 follow-up: the publish date comes from the
+            # standalone date line in the body, never from the
+            # harvest "date" field (it can hold the period start).
+            h_day = _harvest_publish_date(h.get("body"))
             # Date gate (issue #55 follow-up): when both dates are
             # known they must be within 3 days — an October AGM
             # summary and a November EGM invitation share the whole
@@ -337,17 +366,15 @@ def attach_egx_harvest(disc, ticker, days=30):
     added = 0
     today = datetime.now(timezone.utc).date()
     for h in list(h_items):
-        h_day = None
-        try:
-            h_day = datetime.strptime(h.get("date", ""),
-                                      "%Y-%m-%d").date()
-        except Exception:
-            pass
+        # Issue #109 follow-up: same standalone-date-line rule as
+        # the attach loop above; an item with no such line is added
+        # dateless ("") rather than stamped with a period start.
+        h_day = _harvest_publish_date(h.get("body"))
         if h_day is not None and not (0 <= (today - h_day).days <= days):
             continue  # outside the run's window: not this run's news
         disc.append({
             "title": h.get("title") or "",
-            "date": h.get("date") or "",
+            "date": h_day.isoformat() if h_day else "",
             "source": "egx.com.eg",
             "url": h.get("url", ""),
             "kind": "disclosure",
